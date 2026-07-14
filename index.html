@@ -429,27 +429,68 @@ document.getElementById('gallery-input').addEventListener('change', function(e) 
 });
 
 // ── Voice ─────────────────────────────────────────────────────────────────────
+let voiceTranscript = '';
+let voiceEnded = false;
+
 function toggleVoice() {
   if (!ready()) return;
-  if (mic) { stopVoice(); return; }
+  if (mic) { finishVoice(); return; }
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { toast('Voice not available — use Chrome on Android', 'err'); return; }
+
+  voiceTranscript = '';
+  voiceEnded = false;
+
   mic = new SR();
-  mic.continuous = false;
-  mic.interimResults = false;
+  mic.continuous = true;       // Keep listening through pauses, not just one phrase
+  mic.interimResults = false;  // Only accumulate finalised phrases
+  mic.lang = 'en-US';          // Chrome auto-detects Arabic speech reasonably well even with this set
+
   document.getElementById('rec-bar').classList.add('active');
+
   mic.onresult = e => {
-    const txt = e.results[0][0].transcript;
-    stopVoice();
-    sendToGemini('text', null, txt);
+    // Accumulate every finalised chunk of speech as you talk
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) {
+        voiceTranscript += ' ' + e.results[i][0].transcript;
+      }
+    }
   };
-  mic.onerror = e => { stopVoice(); toast('Voice error: ' + e.error, 'err'); };
-  mic.onend   = () => stopVoice();
+
+  mic.onerror = e => {
+    // "no-speech" fires often on silence; ignore it and keep listening if still recording
+    if (e.error !== 'no-speech') {
+      finishVoice();
+      toast('Voice error: ' + e.error, 'err');
+    }
+  };
+
+  // Some browsers auto-stop after a period of silence — restart automatically
+  // unless the user has explicitly tapped Stop
+  mic.onend = () => {
+    if (!voiceEnded && mic) {
+      try { mic.start(); } catch(_) {}
+    }
+  };
+
   mic.start();
 }
-function stopVoice() {
+
+function finishVoice() {
+  voiceEnded = true;
   if (mic) { try { mic.stop(); } catch(_){} mic = null; }
   document.getElementById('rec-bar').classList.remove('active');
+
+  const txt = voiceTranscript.trim();
+  if (txt) {
+    sendToGemini('text', null, txt);
+  } else {
+    toast('No speech detected — try again', 'err');
+  }
+}
+
+function stopVoice() {
+  finishVoice();
 }
 
 // ── Text ──────────────────────────────────────────────────────────────────────
