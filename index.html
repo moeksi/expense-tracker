@@ -229,7 +229,7 @@ body {
 <!-- PREVIEW -->
 <div class="screen" id="s-preview">
   <div class="header">
-    <button class="icon-btn" onclick="go('s-home')" aria-label="Back">←</button>
+    <button class="icon-btn" onclick="cancelPreview()" aria-label="Back">←</button>
     <h1>Review expense</h1>
     <div style="width:36px"></div>
   </div>
@@ -284,7 +284,7 @@ body {
   </div>
   <div class="bottom-actions">
     <button class="btn-primary" onclick="logExpense()">✓ Log this expense</button>
-    <button class="btn-secondary" onclick="go('s-home')">Cancel</button>
+    <button class="btn-secondary" onclick="cancelPreview()">Cancel</button>
   </div>
 </div>
 
@@ -360,6 +360,7 @@ Category guide (choose the best match):
 
 // ── State ─────────────────────────────────────────────────────────────────────
 let mic = null;
+let pendingRawInput = null; // Holds the original photo or exact wording until logged or cancelled
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -411,10 +412,39 @@ function openGallery() {
   if (!ready()) return;
   document.getElementById('gallery-input').click();
 }
+// Resizes and compresses an image before it is sent anywhere, so receipt
+// photos stay quick to upload and light on storage without losing legibility.
+function compressImage(dataUrl, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      const scale = Math.min(1, maxDim / Math.max(width, height));
+      width  = Math.round(width  * scale);
+      height = Math.round(height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width  = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality).split(',')[1]);
+    };
+    img.onerror = () => reject(new Error('Could not process image'));
+    img.src = dataUrl;
+  });
+}
+
 function handleImageFile(file) {
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = () => sendToGemini('photo', reader.result.split(',')[1], null);
+  reader.onload = async () => {
+    try {
+      const base64 = await compressImage(reader.result, 1600, 0.75);
+      pendingRawInput = { type: 'photo', data: base64 };
+      sendToGemini('photo', base64, null);
+    } catch (err) {
+      toast('Image error: ' + err.message, 'err');
+    }
+  };
   reader.readAsDataURL(file);
 }
 document.getElementById('cam-input').addEventListener('change', function(e) {
@@ -430,6 +460,7 @@ document.getElementById('gallery-input').addEventListener('change', function(e) 
 
 // ── Voice ─────────────────────────────────────────────────────────────────────
 let voiceTranscript = '';
+let voiceInterim = '';
 let voiceEnded = false;
 
 function toggleVoice() {
@@ -439,22 +470,31 @@ function toggleVoice() {
   if (!SR) { toast('Voice not available — use Chrome on Android', 'err'); return; }
 
   voiceTranscript = '';
+  voiceInterim = '';
   voiceEnded = false;
 
   mic = new SR();
   mic.continuous = true;       // Keep listening through pauses, not just one phrase
-  mic.interimResults = false;  // Only accumulate finalised phrases
+  mic.interimResults = true;   // Also track not-yet-finalised text as a fallback —
+                                // on Android Chrome, continuous mode can silently
+                                // fail to ever finalise a result even though speech
+                                // was picked up at the interim level
   mic.lang = 'en-US';          // Chrome auto-detects Arabic speech reasonably well even with this set
 
   document.getElementById('rec-bar').classList.add('active');
 
   mic.onresult = e => {
-    // Accumulate every finalised chunk of speech as you talk
+    // Accumulate every finalised chunk of speech as you talk, and keep the
+    // latest not-yet-finalised chunk as a fallback in case it never finalises
+    let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
       if (e.results[i].isFinal) {
         voiceTranscript += ' ' + e.results[i][0].transcript;
+      } else {
+        interim += ' ' + e.results[i][0].transcript;
       }
     }
+    voiceInterim = interim; // unconditional replace — finalised text drops out of future interim results on its own
   };
 
   mic.onerror = e => {
@@ -469,7 +509,12 @@ function toggleVoice() {
   // unless the user has explicitly tapped Stop
   mic.onend = () => {
     if (!voiceEnded && mic) {
-      try { mic.start(); } catch(_) {}
+      try {
+        mic.start();
+      } catch (err) {
+        finishVoice();
+        toast('Voice restart failed: ' + err.message, 'err');
+      }
     }
   };
 
@@ -481,8 +526,10 @@ function finishVoice() {
   if (mic) { try { mic.stop(); } catch(_){} mic = null; }
   document.getElementById('rec-bar').classList.remove('active');
 
-  const txt = voiceTranscript.trim();
+  const txt = (voiceTranscript + ' ' + voiceInterim).trim();
+  voiceInterim = '';
   if (txt) {
+    pendingRawInput = { type: 'text', value: txt };
     sendToGemini('text', null, txt);
   } else {
     toast('No speech detected — try again', 'err');
@@ -499,6 +546,7 @@ function submitText() {
   const val = document.getElementById('txt').value.trim();
   if (!val) { toast('Please type an expense first', 'err'); return; }
   document.getElementById('txt').value = '';
+  pendingRawInput = { type: 'text', value: val };
   sendToGemini('text', null, val);
 }
 document.getElementById('txt').addEventListener('keydown', e => {
@@ -541,10 +589,26 @@ Return ONLY a valid JSON object — no markdown, no explanation, no extra text:
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || 'HTTP ' + res.status);
 
-    // Extract text from Gemini response structure
-    const raw = data.candidates[0].content.parts[0].text
-      .trim().replace(/```json|```/g, '').trim();
-    showPreview(JSON.parse(raw));
+    // Extract text from Gemini response structure, with clear errors instead
+    // of raw JS exceptions for the ways a 200 OK response can still be unusable
+    const candidate = data.candidates?.[0];
+    if (!candidate) {
+      const reason = data.promptFeedback?.blockReason;
+      throw new Error(reason ? 'Blocked by Gemini: ' + reason : 'No response from Gemini — try again');
+    }
+    if (candidate.finishReason && candidate.finishReason !== 'STOP') {
+      throw new Error('Gemini response incomplete (' + candidate.finishReason + ') — try again');
+    }
+    const rawText = candidate.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error('Empty response from Gemini — try again');
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText.trim().replace(/```json|```/g, '').trim());
+    } catch (_) {
+      throw new Error("Could not understand Gemini's response — try again");
+    }
+    showPreview(parsed);
 
   } catch(err) {
     toast('Error: ' + err.message, 'err');
@@ -568,6 +632,10 @@ function pickPay(btn) {
   document.querySelectorAll('.pay-btn').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
 }
+function cancelPreview() {
+  pendingRawInput = null; // Discard the captured photo or wording along with the entry
+  go('s-home');
+}
 
 // ── Log to Google Sheets ──────────────────────────────────────────────────────
 async function logExpense() {
@@ -579,6 +647,18 @@ async function logExpense() {
     category:       document.getElementById('f-cat').value,
     payment_method: document.querySelector('.pay-btn.active')?.dataset.v || 'Cash'
   };
+
+  // Attach the original photo or exact wording so it lands in the Raw Input column
+  if (pendingRawInput) {
+    if (pendingRawInput.type === 'photo') {
+      exp.raw_type       = 'photo';
+      exp.raw_image_data = pendingRawInput.data;
+    } else if (pendingRawInput.type === 'text') {
+      exp.raw_type = 'text';
+      exp.raw_text = pendingRawInput.value;
+    }
+  }
+
   loading(true, 'Logging…');
   try {
     await fetch(url, {
@@ -586,6 +666,7 @@ async function logExpense() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(exp)
     });
+    pendingRawInput = null; // Only clear once the log has actually gone through
     go('s-home');
     toast('✓ ' + exp.amount + ' — ' + exp.description, 'ok');
   } catch(err) {
